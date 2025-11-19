@@ -19,113 +19,165 @@ Bu altyapı, modern ML projelerinde ihtiyaç duyulan temel bileşenleri tek çat
 Amaç:  
 **Model kodunu eğitim mekanizmalarından tamamen ayırarak**, farklı projelerde yeniden kullanılabilir, düzenli ve sürdürülebilir bir yapı oluşturmak.
 ```python
+import sys
+sys.path.append(r"C:\Users\hdgn5\OneDrive\Masaüstü\hysollm")
+
+import json
+import torch
+
+# ======================================
+# Hyso Core (config + storage)
+# ======================================
 from hyso.core.config import load_config_with_overrides
 from hyso.core.storage import (
     RunPathFactory,
     get_logger,
     Manifest,
     save_manifest,
+    set_global_seed,
     CheckpointConfig,
     CheckpointManager,
-    set_global_seed,
 )
-from hyso.core.tokenizer import HysoBPETokenizer
-from hyso.core.models.encoder_only import HysoEncoderOnly
-from hyso.core.train import Trainer
 
-import torch
-from torch.utils.data import DataLoader, TensorDataset
+# ======================================
+# Hyso Train & Tokenizer
+# ======================================
+from hyso.core.train.trainer import HysoTrainer
+from hyso.core.train.metrics import LLMetrics
+from hyso.core.train.callbacks import HysoCallbacks
+from hyso.core.train.dataloader import build_dataloader   # <-- KÜTÜPHANEDE VAR
+from hyso.core.tokenizer.bpe_tokenizer import HysoBPETokenizer
 
+# ======================================
+# Hyso Model
+# ======================================
+import hyso
 
-# ---------------------------------------------------------
-# 1) Config yükleme (+ override desteği)
-# ---------------------------------------------------------
+# =====================================================================
+# 1) CONFIG YÜKLE (YAML dosyasından + CLI override desteği)
+# =====================================================================
 
 cfg = load_config_with_overrides(
     path="configs/base.yaml",
-    override_pairs=["training.lr=0.0001", "model.dim=512"]
+    override_pairs=sys.argv[1:],   # Örn: training.lr=0.0001
 )
 
-
-# ---------------------------------------------------------
-# 2) Run path oluşturma
-# ---------------------------------------------------------
+# =====================================================================
+# 2) STORAGE YAPISI KUR (RunPaths, Logger, Seed, Manifest)
+# =====================================================================
 
 factory = RunPathFactory.from_root("runs")
 run_paths = factory.create()
 
 logger = get_logger("train", log_dir=run_paths.logs_dir)
-logger.info(f"Run başlatıldı: {run_paths.run_id}")
-
-
-# ---------------------------------------------------------
-# 3) Seed ayarı (deterministik eğitim için)
-# ---------------------------------------------------------
+logger.info(f"Yeni run başlatıldı: {run_paths.run_id}")
 
 set_global_seed(cfg.training.seed)
 
+# =====================================================================
+# 3) VERİSETİNİN NEREDE DURMASI GEREKİR?
+# =====================================================================
+"""
+Gerçek ve profesyonel dizin yapısı:
 
-# ---------------------------------------------------------
-# 4) Manifest oluşturma
-# ---------------------------------------------------------
+project/
+   data/
+      train.json
+      val.json
+      test.json
 
-manifest = Manifest.new(
-    run_id=run_paths.run_id,
-    model=cfg.model,
-    training=cfg.training,
-    data={"name": "dummy"},
-)
+Dosya formatı:
+[
+  {"src": "merhaba dünya", "tgt": "hello world"},
+  {"src": "nasılsın", "tgt": "how are you"},
+  ...
+]
 
-save_manifest(run_paths.manifest_path, manifest)
-logger.info("Manifest kaydedildi.")
+Bu format seq2seq için *standarttır* ve HysoTrainer'ın collate yapısıyla
+doğrudan uyumludur.
+"""
 
+with open("data/train.json", "r", encoding="utf-8") as f:
+    train_records = json.load(f)
 
-# ---------------------------------------------------------
-# 5) Tokenizer yükleme
-# ---------------------------------------------------------
+with open("data/val.json", "r", encoding="utf-8") as f:
+    val_records = json.load(f)
 
-tokenizer = HysoBPETokenizer(
-    lowercase=True,
+logger.info(f"Verisetleri yüklendi. Train: {len(train_records)}, Val: {len(val_records)}")
+
+# =====================================================================
+# 4) TOKENIZER TRAIN 
+# =====================================================================
+
+corpus = [item["src"] for item in train_records] + \
+         [item["tgt"] for item in train_records]
+
+tok = HysoBPETokenizer(
+    lowercase=False,
     normalize="NFKC",
-    cache_size=5000,
+    cache_size=10000,
 )
 
-
-# ---------------------------------------------------------
-# 6) Model oluşturma
-# ---------------------------------------------------------
-
-model = HysoEncoderOnly(
-    dim=cfg.model.dim,
-    num_layers=cfg.model.layers,
-    vocab_size=tokenizer.vocab_size,
+tok.fit(
+    corpus=corpus,
+    target_vocab_size=cfg.tokenizer.vocab_size,
+    min_pair_freq=2,
 )
 
-model = model.to(cfg.training.device)
+logger.info(f"Tokenizer hazır. Vocab size: {tok.vocab_size}")
 
+# =====================================================================
+# 5) DATALOADER — KÜTÜPHANEDE KENDİ BUILD_DATALOADER VAR
+# =====================================================================
 
-# ---------------------------------------------------------
-# 7) Dataset & Dataloader
-# ---------------------------------------------------------
+train_loader = build_dataloader(
+    dataset=train_records,     # list[dict{src,tgt}]
+    mode="seq2seq",
+    tokenizer=tok,
+    batch_size=cfg.training.batch_size,
+    max_src_len=cfg.data.max_src_len,
+    max_tgt_len=cfg.data.max_tgt_len,
+    shuffle=True,
+)
 
-X = torch.randint(0, tokenizer.vocab_size, (100, 32))
-y = torch.randint(0, tokenizer.vocab_size, (100, 32))
+val_loader = build_dataloader(
+    dataset=val_records,
+    mode="seq2seq",
+    tokenizer=tok,
+    batch_size=cfg.training.batch_size,
+    max_src_len=cfg.data.max_src_len,
+    max_tgt_len=cfg.data.max_tgt_len,
+    shuffle=False,
+)
 
-dataset = TensorDataset(X, y)
-loader = DataLoader(dataset, batch_size=cfg.training.batch_size, shuffle=True)
+# =====================================================================
+# 6) MODEL OLUŞTUR
+# =====================================================================
 
+model = hyso.HysoLLM(
+    vocab_src=tok.vocab_size,
+    vocab_tgt=tok.vocab_size,
+    d_model=cfg.model.dim,
+    n_heads=cfg.model.heads,
+).to(cfg.training.device)
 
-# ---------------------------------------------------------
-# 8) Optimizer & Scheduler
-# ---------------------------------------------------------
+logger.info("Model oluşturuldu.")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+# =====================================================================
+# 7) METRICS + CALLBACKS + CHECKPOINTMANAGER
+# =====================================================================
 
+metrics = LLMetrics(
+    bleu=False,
+    perplexity=True,
+    token_accuracy=True,
+    token_ignore_index=-100,
+)
 
-# ---------------------------------------------------------
-# 9) Checkpoint yöneticisi
-# ---------------------------------------------------------
+callbacks = HysoCallbacks.default(
+    total_steps=len(train_loader) * cfg.training.epochs,
+    save_dir=str(run_paths.checkpoints_dir),
+)
 
 ckpt_cfg = CheckpointConfig.from_dir(
     directory=run_paths.checkpoints_dir,
@@ -135,34 +187,36 @@ ckpt_cfg = CheckpointConfig.from_dir(
 
 checkpoint_manager = CheckpointManager(ckpt_cfg)
 
+# =====================================================================
+# 8) TRAINER — KÜTÜPHANE TAM ENTEGRE
+# =====================================================================
 
-# ---------------------------------------------------------
-# 10) Trainer oluşturma
-# ---------------------------------------------------------
-
-trainer = Trainer(
+trainer = HysoTrainer(
     model=model,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    tokenizer=tokenizer,
-    config=cfg,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    tokenizer=tok,
+    epochs=cfg.training.epochs,
+    lr=cfg.training.lr,
+    optimizer=cfg.training.optimizer,
+    scheduler=cfg.training.scheduler,
+    warmup_ratio=cfg.training.warmup_ratio,
+    ignore_index=-100,
+    callbacks=callbacks,
+    metrics=metrics,
+    logger=logger,
     run_paths=run_paths,
     checkpoint_manager=checkpoint_manager,
-    logger=logger,
+    config=cfg,
 )
 
+# =====================================================================
+# 9) EĞİTİM BAŞLAT
+# =====================================================================
 
-# ---------------------------------------------------------
-# 11) Eğitim döngüsü
-# ---------------------------------------------------------
-
-trainer.fit(
-    train_loader=loader,
-    val_loader=loader,
-    epochs=cfg.training.epochs,
-)
-
+result = trainer.fit()
 logger.info("Eğitim tamamlandı.")
+
 
 ```
 ---
